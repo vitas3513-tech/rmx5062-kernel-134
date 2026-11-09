@@ -275,6 +275,43 @@ jobs:
             CC="${{ env.CC_CMD }}" \
             KCFLAGS+=-Wno-error Image 2>&1 | tee ../build.log
 
+      - name: Build modules
+        run: |
+          set -e
+          set -o pipefail
+          cd workspace/common
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export CCACHE_COMPILERCHECK=none
+          export CCACHE_BASEDIR="$(pwd)"
+          export CCACHE_NOHASHDIR=true
+          export CCACHE_NOHARDLINK=true
+          export CCACHE_IS_KERNEL_COMPILING=true
+          
+          echo "--- Building vendor modules ---"
+          make -j"$(nproc)" LLVM=${{ env.LLVM_FLAG }} ARCH=arm64 O=out \
+            CC="${{ env.CC_CMD }}" \
+            KCFLAGS+=-Wno-error modules 2>&1 | tee ../modules.log
+          
+          echo "--- Installing modules ---"
+          make LLVM=${{ env.LLVM_FLAG }} ARCH=arm64 O=out \
+            INSTALL_MOD_PATH=../modules_install \
+            INSTALL_MOD_STRIP=1 \
+            modules_install
+          
+          # Count built modules
+          MOD_COUNT=$(find ../modules_install/lib/modules -name '*.ko' | wc -l)
+          echo "Built modules: $MOD_COUNT"
+          
+          # List top-level module directories
+          echo "--- Module directories ---"
+          find ../modules_install/lib/modules -type d -maxdepth 3
+          
+          # Verify critical MTK modules exist
+          echo "--- Checking critical modules ---"
+          for mod in wlan btmtk gps; do
+            find ../modules_install -name "*${mod}*.ko" | head -3
+          done
+
       - name: Verify
         run: |
           set -e
@@ -357,6 +394,14 @@ jobs:
           include-hidden-files: true
           if-no-files-found: warn
 
+      - name: Upload kernel modules
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-6.1.134
+          path: workspace/modules_install/lib/modules/
+          if-no-files-found: warn
+
       - name: Save ccache
         if: always() && !cancelled()
         uses: actions/cache/save@v4
@@ -372,6 +417,20 @@ jobs:
           git clone -q --depth=1 https://github.com/cctv18/AnyKernel3
           rm -rf AnyKernel3/.git
           cp common/out/arch/arm64/boot/Image AnyKernel3/Image
+          
+          # Copy modules to AnyKernel3/modules/vendor/lib/modules/
+          # AnyKernel3 will flash them to /vendor/lib/modules/
+          if [ -d modules_install/lib/modules ]; then
+            echo "--- Packaging modules ---"
+            MOD_DIR=$(find modules_install/lib/modules -mindepth 1 -maxdepth 1 -type d | head -1)
+            if [ -n "$MOD_DIR" ]; then
+              mkdir -p AnyKernel3/modules/vendor/lib
+              cp -r "$MOD_DIR" AnyKernel3/modules/vendor/lib/modules
+              MOD_COUNT=$(find AnyKernel3/modules -name '*.ko' | wc -l)
+              echo "Packaged $MOD_COUNT modules"
+            fi
+          fi
+          
           cd AnyKernel3
 
           AK3_NAME="AnyKernel3_RMX5062_6.1.134_Droidspaces_${SUFFIX}_${{ env.CLANG_LABEL }}.zip"
@@ -384,7 +443,7 @@ jobs:
             echo "Config: stock RMX5062 16.0.2.401 /proc/config.gz"
             echo "Patch: SYSVIPC kABI + oplus_bsp_midas"
             echo "Root: none built in (Magisk stays in init_boot)"
-            echo "Replaces: kernel Image in the active boot slot only"
+            echo "Replaces: kernel Image + vendor modules"
             echo "Toolchain: ${{ env.CLANG_LABEL }}"
             echo "Run: ${GITHUB_RUN_ID}"
           } > ak3.log
@@ -408,6 +467,7 @@ jobs:
           path: |
             workspace/config.log
             workspace/build.log
+            workspace/modules.log
           if-no-files-found: warn
 
   release:
