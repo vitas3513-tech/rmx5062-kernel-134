@@ -1,0 +1,292 @@
+name: RMX5062 6.1.134 Droidspaces (Magisk)
+
+# Builds a GKI Image for realme RMX5062 (MT6989) from the public realme
+# Neo7 Android 16 / 6.1.134 tree, using the device's own stock config as the
+# base. Only the kernel Image is produced; vendor modules, dtb/dtbo and the
+# Magisk-patched init_boot are left untouched.
+#
+# No built-in root is added on purpose: the device uses Magisk in init_boot.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: 'realme_neo7-AndroidB-kernel-source commit'
+        required: true
+        default: '7b5237439c069ced227fc18116eb707580c5fe51'
+      fast_build:
+        description: 'Disable DEBUG_INFO / BTF (faster, no BTF in Image)'
+        type: boolean
+        default: true
+      clean_ccache:
+        description: 'Do not restore ccache'
+        type: boolean
+        default: false
+      make_release:
+        description: 'Create a GitHub Release after a successful build'
+        type: boolean
+        default: false
+
+env:
+  KERNEL_VERSION: '6.1'
+  SUB_VERSION: '134'
+  SUFFIX: 'android14-11-o-g543c4ee0444c'
+  SOURCE_REPO: 'realme-kernel-opensource/realme_neo7-AndroidB-kernel-source'
+  CCACHE_KEY: 'ccache-rmx5062-6.1.134-mt6989'
+  TZ: 'UTC'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: write
+    outputs:
+      ak3name: ${{ steps.package.outputs.ak3name }}
+      fullver: ${{ steps.package.outputs.fullver }}
+
+    steps:
+      - name: Checkout build repo
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            aria2 binutils bison flex dwarves python-is-python3 ccache \
+            libssl-dev libelf-dev zip unzip cpio bc xz-utils patch openssl
+
+      - name: Download kernel source and LLVM
+        run: |
+          set -e
+          mkdir -p workspace
+          cd workspace
+          aria2c -s16 -x16 -k1M -q \
+            "https://github.com/${SOURCE_REPO}/archive/${{ inputs.source_commit }}.tar.gz" \
+            -o source.tar.gz
+          aria2c -s16 -x16 -k1M -q \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-Linux-X64.tar.xz" \
+            -o llvm.tar.xz
+
+          tar -xf source.tar.gz
+          SRC_DIR=$(find . -maxdepth 1 -type d -name 'realme_neo7-AndroidB-kernel-source-*' | head -1)
+          [ -n "$SRC_DIR" ] || { echo "::error::source directory not found"; exit 1; }
+          mv "$SRC_DIR" common
+
+          mkdir clang20
+          tar -xf llvm.tar.xz
+          LLVM_DIR=$(find . -maxdepth 1 -type d -name 'LLVM-*' | head -1)
+          [ -n "$LLVM_DIR" ] || { echo "::error::LLVM directory not found"; exit 1; }
+          mv "$LLVM_DIR"/* clang20/
+          rm -f source.tar.gz llvm.tar.xz
+
+          echo "source: $(grep -m1 '^SUBLEVEL' common/Makefile)"
+          echo "clang:  $(./clang20/bin/clang --version | head -1)"
+
+      - name: Configure ccache
+        run: |
+          echo "CCACHE_DIR=$HOME/.ccache_rmx5062_6.1.134" >> "$GITHUB_ENV"
+          echo "CCACHE_MAXSIZE=4G" >> "$GITHUB_ENV"
+
+      - name: Restore ccache
+        if: ${{ !inputs.clean_ccache }}
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_KEY }}-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            ${{ env.CCACHE_KEY }}-${{ runner.os }}-
+
+      - name: Prepare tree
+        run: |
+          set -e
+          cd workspace/common
+
+          # Clang 20 is stricter than the compiler this 6.1 tree was written for.
+          sed -i 's/^override CFLAGS += -Werror -Wall$/override CFLAGS += -Wall/' tools/lib/bpf/Makefile
+          grep -q '^override CFLAGS += -Wall$' tools/lib/bpf/Makefile \
+            && echo "[fix] tools/lib/bpf: removed -Werror"
+
+          # No -dirty in UTS_RELEASE.
+          sed -i 's/ -dirty//g' scripts/setlocalversion
+          sed -i '$i res=$(echo "$res" | sed "s/-dirty//g")' scripts/setlocalversion
+
+          # Apply the two mandatory Droidspaces patches.
+          patch -p1 --batch -r - < ../../patches/01-fix_sysvipc_kabi_6_1_134.patch
+          patch -p1 --batch -r - < ../../patches/02-fix_oplus_bsp_midas.patch
+
+          grep -q 'ANDROID_KABI_USE(6, struct sysv_sem sysvsem)' include/linux/sched.h \
+            || { echo "::error::SYSVIPC kABI patch did not apply"; exit 1; }
+          grep -q 'ghost-task-sentinel' kernel/pid.c \
+            || { echo "::error::oplus_bsp_midas patch did not apply"; exit 1; }
+
+      - name: Write defconfig
+        run: |
+          set -e
+          cd workspace/common
+          cp ../../configs/stock-6.1.134.config arch/arm64/configs/rmx5062_defconfig
+          DEFCONFIG=arch/arm64/configs/rmx5062_defconfig
+
+          # Belt and braces: values are already in the committed config.
+          sed -i 's|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION="-android14-11-o-g543c4ee0444c"|' "$DEFCONFIG"
+          sed -i 's|^CONFIG_LOCALVERSION_AUTO=.*|CONFIG_LOCALVERSION_AUTO=n|' "$DEFCONFIG"
+          sed -i 's|^CONFIG_MODULE_SIG_KEY=.*|CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"|' "$DEFCONFIG"
+
+          if [ "${{ inputs.fast_build }}" = "true" ]; then
+            cat >> "$DEFCONFIG" << 'EOF'
+          CONFIG_DEBUG_INFO_NONE=y
+          # CONFIG_DEBUG_INFO_BTF is not set
+          # CONFIG_DEBUG_INFO_DWARF4 is not set
+          EOF
+          fi
+
+          echo "--- requested container options ---"
+          grep -E '^CONFIG_(SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|USER_NS|DEVTMPFS|MACVLAN|CGROUP_DEVICE|NETFILTER_XT_MATCH_ADDRTYPE|IP6_NF_NAT|IP6_NF_TARGET_MASQUERADE)=' "$DEFCONFIG" || true
+
+      - name: Build configuration
+        run: |
+          set -e
+          set -o pipefail
+          cd workspace/common
+          export PATH="$(pwd)/../clang20/bin:$PATH"
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 O=out \
+            CC="ccache clang" LD=ld.lld HOSTLD=ld.lld \
+            KCFLAGS+=-Wno-error rmx5062_defconfig 2>&1 | tee ../config.log
+
+          echo "--- effective options ---"
+          grep -E '^CONFIG_(ARM64|64BIT|SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|USER_NS|DEVTMPFS|MACVLAN|CGROUP_DEVICE|NETFILTER_XT_MATCH_ADDRTYPE|IP6_NF_NAT|CFS_BANDWIDTH|CGROUP_PIDS|MODULE_SIG_FORCE)=' out/.config || true
+          for c in ARM64 64BIT SYSVIPC POSIX_MQUEUE PID_NS IPC_NS USER_NS DEVTMPFS MACVLAN; do
+            grep -q "^CONFIG_${c}=y$" out/.config \
+              || { echo "::error::CONFIG_${c} did not survive olddefconfig"; exit 1; }
+          done
+
+      - name: Build Image
+        run: |
+          set -e
+          set -o pipefail
+          cd workspace/common
+          export PATH="$(pwd)/../clang20/bin:$PATH"
+          export CCACHE_DIR="${{ env.CCACHE_DIR }}"
+          export CCACHE_COMPILERCHECK=none
+          export CCACHE_BASEDIR="$(pwd)"
+          export CCACHE_NOHASHDIR=true
+          export CCACHE_NOHARDLINK=true
+          export CCACHE_IS_KERNEL_COMPILING=true
+          echo "sloppiness = file_stat_matches,include_file_ctime,include_file_mtime,time_macros" >> "$CCACHE_DIR/ccache.conf"
+
+          ( while true; do
+              sleep 60
+              echo "[hb] $(date -u +%H:%M:%SZ) objs=$(find out -name '*.o' 2>/dev/null | wc -l)"
+            done ) &
+          HB=$!
+          trap 'kill $HB 2>/dev/null || true' EXIT
+
+          make -j"$(nproc)" LLVM=1 ARCH=arm64 O=out \
+            CC="ccache clang" LD=ld.lld HOSTLD=ld.lld \
+            KCFLAGS+=-Wno-error Image 2>&1 | tee ../build.log
+
+      - name: Verify
+        run: |
+          set -e
+          cd workspace/common
+          ls -lh out/arch/arm64/boot/Image
+          UTS=$(sed -n 's/.*UTS_RELEASE "\(.*\)"/\1/p' out/include/generated/utsrelease.h)
+          echo "UTS_RELEASE=$UTS"
+          [ "$UTS" = "6.1.134-${SUFFIX}" ] \
+            || { echo "::error::UTS_RELEASE mismatch: expected 6.1.134-${SUFFIX}, got $UTS"; exit 1; }
+
+          CFG=out/include/config/auto.conf
+          [ -f "$CFG" ] || CFG=out/.config
+          for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS USER_NS DEVTMPFS MACVLAN; do
+            grep -q "^CONFIG_${c}=y$" "$CFG" \
+              || { echo "::error::CONFIG_${c} is not enabled"; exit 1; }
+          done
+          for o in kernel/pid_namespace.o drivers/base/devtmpfs.o; do
+            [ -f "out/$o" ] || { echo "::error::missing out/$o"; exit 1; }
+          done
+          for c in CFS_BANDWIDTH CGROUP_PIDS MODULE_SIG_FORCE; do
+            grep -q "^CONFIG_${c}=y$" "$CFG" \
+              && { echo "::error::CONFIG_${c} must not be enabled"; exit 1; }
+          done
+          echo "verification passed"
+
+      - name: Upload raw Image
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-raw-6.1.134
+          path: workspace/common/out/arch/arm64/boot/Image
+          if-no-files-found: warn
+
+      - name: Save ccache
+        if: always() && !cancelled()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ env.CCACHE_KEY }}-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Package AnyKernel3
+        id: package
+        run: |
+          set -e
+          cd workspace
+          git clone -q --depth=1 https://github.com/cctv18/AnyKernel3
+          rm -rf AnyKernel3/.git
+          cp common/out/arch/arm64/boot/Image AnyKernel3/Image
+          cd AnyKernel3
+
+          AK3_NAME="AnyKernel3_RMX5062_6.1.134_Droidspaces_${SUFFIX}.zip"
+          zip -rq "../$AK3_NAME" ./*
+
+          {
+            echo "Device: realme RMX5062 / RE602EL1 (MT6989)"
+            echo "Kernel: 6.1.134-${SUFFIX}"
+            echo "Source: ${SOURCE_REPO}@${{ inputs.source_commit }}"
+            echo "Config: stock RMX5062 16.0.2.401 /proc/config.gz"
+            echo "Patch: SYSVIPC kABI + oplus_bsp_midas"
+            echo "Root: none built in (Magisk stays in init_boot)"
+            echo "Replaces: kernel Image in the active boot slot only"
+            echo "Run: ${GITHUB_RUN_ID}"
+          } > ak3.log
+          zip -zq "../$AK3_NAME" < ak3.log
+
+          echo "ak3name=$AK3_NAME" >> "$GITHUB_OUTPUT"
+          echo "fullver=6.1.134-${SUFFIX}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload AnyKernel3
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.ak3name }}
+          path: workspace/${{ steps.package.outputs.ak3name }}
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            workspace/config.log
+            workspace/build.log
+          if-no-files-found: warn
+
+  release:
+    if: inputs.make_release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir -p release_zips && cd release_zips
+          gh run download "$GITHUB_RUN_ID" -n "${{ needs.build.outputs.ak3name }}" -R "$GITHUB_REPOSITORY"
+          TAG="rmx5062-6.1.134-$(date +'%Y%m%d-%H%M')"
+          gh release create "$TAG" ./*.zip -R "$GITHUB_REPOSITORY" \
+            -t "RMX5062 6.1.134 Droidspaces $(date +'%Y-%m-%d')" \
+            -N "realme RMX5062 (MT6989) 6.1.134 + Droidspaces, built from the public realme Neo7 Android 16 tree and the device's stock config. Magisk remains in init_boot. Kernel Image only."
