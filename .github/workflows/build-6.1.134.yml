@@ -109,9 +109,9 @@ jobs:
           grep -q '^override CFLAGS += -Wall$' tools/lib/bpf/Makefile \
             && echo "[fix] tools/lib/bpf: removed -Werror"
 
-          # No -dirty in UTS_RELEASE.
-          sed -i 's/ -dirty//g' scripts/setlocalversion
-          sed -i '$i res=$(echo "$res" | sed "s/-dirty//g")' scripts/setlocalversion
+          # Build happens from a release tarball (no .git), so setlocalversion
+          # cannot append -dirty. Kernel release is fully determined by
+          # CONFIG_LOCALVERSION and is checked in the Verify step.
 
           # Apply the two mandatory Droidspaces patches.
           patch -p1 --batch -r - < ../../patches/01-fix_sysvipc_kabi_6_1_134.patch
@@ -210,6 +210,9 @@ jobs:
             grep -q "^CONFIG_${c}=y$" "$CFG" \
               && { echo "::error::CONFIG_${c} must not be enabled"; exit 1; }
           done
+          # Required for the SYSVIPC kABI patch to preserve task_struct layout.
+          grep -q '^CONFIG_ANDROID_KABI_RESERVE=y$' "$CFG" \
+            || { echo "::error::CONFIG_ANDROID_KABI_RESERVE must be enabled"; exit 1; }
           echo "verification passed"
 
       - name: Upload raw Image
@@ -218,6 +221,18 @@ jobs:
         with:
           name: Image-raw-6.1.134
           path: workspace/common/out/arch/arm64/boot/Image
+          if-no-files-found: warn
+
+      - name: Upload kernel metadata
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-meta-6.1.134
+          path: |
+            workspace/common/out/Module.symvers
+            workspace/common/out/.config
+            workspace/common/out/include/generated/utsrelease.h
+            workspace/common/out/include/config/auto.conf
           if-no-files-found: warn
 
       - name: Save ccache
