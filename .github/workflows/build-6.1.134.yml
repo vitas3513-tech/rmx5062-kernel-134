@@ -34,6 +34,10 @@ on:
         description: 'Create a GitHub Release after a successful build'
         type: boolean
         default: false
+      use_clang17:
+        description: 'Use AOSP prebuilt Clang 17 r487747c (matches stock kernel, minimizes ABI mismatches)'
+        type: boolean
+        default: false
 
 env:
   KERNEL_VERSION: '6.1'
@@ -65,10 +69,25 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             aria2 binutils bison flex dwarves python-is-python3 ccache \
-            libssl-dev libelf-dev zip unzip cpio bc xz-utils patch openssl \
-            clang-18 lld-18 llvm-18
-          clang-18 --version | head -1
-          ld.lld-18 --version | head -1
+            libssl-dev libelf-dev zip unzip cpio bc xz-utils patch openssl
+          if [ "${{ inputs.use_clang17 }}" != "true" ]; then
+            sudo apt-get install -y --no-install-recommends clang-18 lld-18 llvm-18
+            clang-18 --version | head -1
+            ld.lld-18 --version | head -1
+          fi
+
+      - name: Download AOSP Clang 17 r487747c
+        if: inputs.use_clang17
+        run: |
+          set -e
+          mkdir -p "$HOME/toolchains"
+          cd "$HOME/toolchains"
+          echo "Downloading AOSP prebuilt clang-r487747c from android14-release..."
+          curl -sSL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android14-release/clang-r487747c.tar.gz" \
+            | tar -xz
+          ./bin/clang --version | head -1
+          ./bin/ld.lld --version | head -1
+          echo "CLANG_PREBUILT=$HOME/toolchains" >> "$GITHUB_ENV"
 
       - name: Download kernel and vendor sources
         run: |
@@ -108,6 +127,23 @@ jobs:
           echo "vendor/oplus/kernel subdirs: $(ls vendor/oplus/kernel | wc -l)"
           [ -f common/drivers/soc/oplus/oplus_resctrl/Kconfig ] \
             || { echo "::error::drivers/soc/oplus/oplus_resctrl/Kconfig not reachable through symlink"; exit 1; }
+
+      - name: Setup Clang 17 env
+        if: inputs.use_clang17
+        run: |
+          echo "${{ env.CLANG_PREBUILT }}/bin" >> "$GITHUB_PATH"
+          echo "LLVM_FLAG=1"                    >> "$GITHUB_ENV"
+          echo "CC_CMD=ccache clang"            >> "$GITHUB_ENV"
+          echo "CLANG_LABEL=clang17-r487747c"   >> "$GITHUB_ENV"
+          echo "CCACHE_KEY=ccache-rmx5062-6.1.134-mt6989-clang17" >> "$GITHUB_ENV"
+
+      - name: Setup Clang 18 env
+        if: ${{ !inputs.use_clang17 }}
+        run: |
+          echo "LLVM_FLAG=-18"                  >> "$GITHUB_ENV"
+          echo "CC_CMD=ccache clang-18"         >> "$GITHUB_ENV"
+          echo "CLANG_LABEL=clang18-apt"        >> "$GITHUB_ENV"
+          echo "CCACHE_KEY=ccache-rmx5062-6.1.134-mt6989-clang18" >> "$GITHUB_ENV"
 
       - name: Configure ccache
         run: |
@@ -198,8 +234,8 @@ jobs:
           set -e
           set -o pipefail
           cd workspace/common
-          make -j"$(nproc)" LLVM=-18 ARCH=arm64 O=out \
-            CC="ccache clang-18" \
+          make -j"$(nproc)" LLVM=${{ env.LLVM_FLAG }} ARCH=arm64 O=out \
+            CC="${{ env.CC_CMD }}" \
             KCFLAGS+=-Wno-error rmx5062_defconfig 2>&1 | tee ../config.log
 
           echo "--- effective options ---"
@@ -235,8 +271,8 @@ jobs:
           HB=$!
           trap 'kill $HB 2>/dev/null || true' EXIT
 
-          make -j"$(nproc)" LLVM=-18 ARCH=arm64 O=out \
-            CC="ccache clang-18" \
+          make -j"$(nproc)" LLVM=${{ env.LLVM_FLAG }} ARCH=arm64 O=out \
+            CC="${{ env.CC_CMD }}" \
             KCFLAGS+=-Wno-error Image 2>&1 | tee ../build.log
 
       - name: Verify
@@ -338,7 +374,7 @@ jobs:
           cp common/out/arch/arm64/boot/Image AnyKernel3/Image
           cd AnyKernel3
 
-          AK3_NAME="AnyKernel3_RMX5062_6.1.134_Droidspaces_${SUFFIX}.zip"
+          AK3_NAME="AnyKernel3_RMX5062_6.1.134_Droidspaces_${SUFFIX}_${{ env.CLANG_LABEL }}.zip"
           zip -rq "../$AK3_NAME" ./*
 
           {
@@ -349,6 +385,7 @@ jobs:
             echo "Patch: SYSVIPC kABI + oplus_bsp_midas"
             echo "Root: none built in (Magisk stays in init_boot)"
             echo "Replaces: kernel Image in the active boot slot only"
+            echo "Toolchain: ${{ env.CLANG_LABEL }}"
             echo "Run: ${GITHUB_RUN_ID}"
           } > ak3.log
           zip -zq "../$AK3_NAME" < ak3.log
