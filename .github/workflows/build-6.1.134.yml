@@ -26,6 +26,10 @@ on:
         description: 'Do not restore ccache'
         type: boolean
         default: false
+      pristine:
+        description: 'ABI control build: pristine stock config, no Droidspaces patches/options'
+        type: boolean
+        default: false
       make_release:
         description: 'Create a GitHub Release after a successful build'
         type: boolean
@@ -142,14 +146,19 @@ jobs:
           # nothing and the release is exactly 6.1.134 + CONFIG_LOCALVERSION.
           echo "setlocalversion: '$(scripts/setlocalversion .)'"
 
-          # Apply the two mandatory Droidspaces patches.
-          patch -p1 --batch -r - < ../../patches/01-fix_sysvipc_kabi_6_1_134.patch
-          patch -p1 --batch -r - < ../../patches/02-fix_oplus_bsp_midas.patch
+          # Apply the two mandatory Droidspaces patches (skipped for the ABI
+          # control build, which must reproduce the stock kernel exactly).
+          if [ "${{ inputs.pristine }}" = "true" ]; then
+            echo "[control] pristine config: patches skipped"
+          else
+            patch -p1 --batch -r - < ../../patches/01-fix_sysvipc_kabi_6_1_134.patch
+            patch -p1 --batch -r - < ../../patches/02-fix_oplus_bsp_midas.patch
 
-          grep -q 'ANDROID_KABI_USE(6, struct sysv_sem sysvsem)' include/linux/sched.h \
-            || { echo "::error::SYSVIPC kABI patch did not apply"; exit 1; }
-          grep -q 'ghost-task-sentinel' kernel/pid.c \
-            || { echo "::error::oplus_bsp_midas patch did not apply"; exit 1; }
+            grep -q 'ANDROID_KABI_USE(6, struct sysv_sem sysvsem)' include/linux/sched.h \
+              || { echo "::error::SYSVIPC kABI patch did not apply"; exit 1; }
+            grep -q 'ghost-task-sentinel' kernel/pid.c \
+              || { echo "::error::oplus_bsp_midas patch did not apply"; exit 1; }
+          fi
 
           # The kernel tree references the OEM code through symlinks into
           # vendor/; the vendor source repo supplies that tree.
@@ -161,7 +170,11 @@ jobs:
         run: |
           set -e
           cd workspace/common
-          cp ../../configs/stock-6.1.134.config arch/arm64/configs/rmx5062_defconfig
+          if [ "${{ inputs.pristine }}" = "true" ]; then
+            cp ../../configs/pristine-6.1.134.config arch/arm64/configs/rmx5062_defconfig
+          else
+            cp ../../configs/stock-6.1.134.config arch/arm64/configs/rmx5062_defconfig
+          fi
           DEFCONFIG=arch/arm64/configs/rmx5062_defconfig
 
           # Belt and braces: values are already in the committed config.
@@ -191,10 +204,16 @@ jobs:
 
           echo "--- effective options ---"
           grep -E '^CONFIG_(ARM64|64BIT|SYSVIPC|POSIX_MQUEUE|PID_NS|IPC_NS|USER_NS|DEVTMPFS|MACVLAN|CGROUP_DEVICE|NETFILTER_XT_MATCH_ADDRTYPE|IP6_NF_NAT|CFS_BANDWIDTH|CGROUP_PIDS|MODULE_SIG_FORCE)=' out/.config || true
-          for c in ARM64 64BIT SYSVIPC POSIX_MQUEUE PID_NS IPC_NS USER_NS DEVTMPFS MACVLAN; do
+          for c in ARM64 64BIT; do
             grep -q "^CONFIG_${c}=y$" out/.config \
               || { echo "::error::CONFIG_${c} did not survive olddefconfig"; exit 1; }
           done
+          if [ "${{ inputs.pristine }}" != "true" ]; then
+            for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS USER_NS DEVTMPFS MACVLAN; do
+              grep -q "^CONFIG_${c}=y$" out/.config \
+                || { echo "::error::CONFIG_${c} did not survive olddefconfig"; exit 1; }
+            done
+          fi
 
       - name: Build Image
         run: |
@@ -243,20 +262,24 @@ jobs:
 
           CFG=out/include/config/auto.conf
           [ -f "$CFG" ] || CFG=out/.config
-          for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS USER_NS DEVTMPFS MACVLAN; do
-            grep -q "^CONFIG_${c}=y$" "$CFG" \
-              || { echo "::error::CONFIG_${c} is not enabled"; exit 1; }
-          done
-          for o in kernel/pid_namespace.o drivers/base/devtmpfs.o; do
-            [ -f "out/$o" ] || { echo "::error::missing out/$o"; exit 1; }
-          done
+          if [ "${{ inputs.pristine }}" != "true" ]; then
+            for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS USER_NS DEVTMPFS MACVLAN; do
+              grep -q "^CONFIG_${c}=y$" "$CFG" \
+                || { echo "::error::CONFIG_${c} is not enabled"; exit 1; }
+            done
+            for o in kernel/pid_namespace.o drivers/base/devtmpfs.o; do
+              [ -f "out/$o" ] || { echo "::error::missing out/$o"; exit 1; }
+            done
+          fi
           for c in CFS_BANDWIDTH CGROUP_PIDS MODULE_SIG_FORCE; do
             grep -q "^CONFIG_${c}=y$" "$CFG" \
               && { echo "::error::CONFIG_${c} must not be enabled"; exit 1; }
           done
-          # Required for the SYSVIPC kABI patch to preserve task_struct layout.
-          grep -q '^CONFIG_ANDROID_KABI_RESERVE=y$' "$CFG" \
-            || { echo "::error::CONFIG_ANDROID_KABI_RESERVE must be enabled"; exit 1; }
+          if [ "${{ inputs.pristine }}" != "true" ]; then
+            # Required for the SYSVIPC kABI patch to preserve task_struct layout.
+            grep -q '^CONFIG_ANDROID_KABI_RESERVE=y$' "$CFG" \
+              || { echo "::error::CONFIG_ANDROID_KABI_RESERVE must be enabled"; exit 1; }
+          fi
           echo "verification passed"
 
       - name: Dump kernel symbol CRCs
