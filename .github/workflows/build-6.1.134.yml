@@ -92,13 +92,18 @@ jobs:
           [ -n "$VSRC_DIR" ] || { echo "::error::vendor source directory not found"; exit 1; }
           [ -d "$VSRC_DIR/vendor/oplus/kernel" ] \
             || { echo "::error::vendor/oplus/kernel missing in vendor source"; exit 1; }
-          cp -a "$VSRC_DIR/vendor" common/vendor
+          # The kernel tree is the "kernel-6.1" project of the OEM workspace and
+          # reaches the OEM code through ../../../../vendor/... symlinks, so the
+          # vendor tree must sit next to it, not inside it.
+          cp -a "$VSRC_DIR/vendor" vendor
 
           rm -f source.tar.gz vendor.tar.gz
           rm -rf "$VSRC_DIR"
 
           echo "kernel: $(grep -m1 '^SUBLEVEL' common/Makefile)"
-          echo "vendor/oplus/kernel subdirs: $(ls common/vendor/oplus/kernel | wc -l)"
+          echo "vendor/oplus/kernel subdirs: $(ls vendor/oplus/kernel | wc -l)"
+          [ -f common/drivers/soc/oplus/oplus_resctrl/Kconfig ] \
+            || { echo "::error::drivers/soc/oplus/oplus_resctrl/Kconfig not reachable through symlink"; exit 1; }
 
       - name: Configure ccache
         run: |
@@ -140,7 +145,7 @@ jobs:
           # The kernel tree references the OEM code through symlinks into
           # vendor/; the vendor source repo supplies that tree.
           echo "--- dangling symlinks after vendor overlay ---"
-          find . -xtype l | head -40
+          find . -xtype l -printf '%p -> %l\n' | head -40
           echo "dangling count: $(find . -xtype l | wc -l)"
 
       - name: Write defconfig
