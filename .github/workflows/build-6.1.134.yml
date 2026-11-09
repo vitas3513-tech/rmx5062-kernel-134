@@ -14,6 +14,10 @@ on:
         description: 'realme_neo7-AndroidB-kernel-source commit'
         required: true
         default: '7b5237439c069ced227fc18116eb707580c5fe51'
+      vendor_commit:
+        description: 'realme_neo7-AndroidB-vendor-source commit'
+        required: true
+        default: '8c6db80605da65e773b818928c748ac1db60b197'
       fast_build:
         description: 'Disable DEBUG_INFO / BTF (faster, no BTF in Image)'
         type: boolean
@@ -32,6 +36,7 @@ env:
   SUB_VERSION: '134'
   SUFFIX: 'android14-11-o-g543c4ee0444c'
   SOURCE_REPO: 'realme-kernel-opensource/realme_neo7-AndroidB-kernel-source'
+  VENDOR_REPO: 'realme-kernel-opensource/realme_neo7-AndroidB-vendor-source'
   CCACHE_KEY: 'ccache-rmx5062-6.1.134-mt6989'
   TZ: 'UTC'
 
@@ -56,34 +61,44 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             aria2 binutils bison flex dwarves python-is-python3 ccache \
-            libssl-dev libelf-dev zip unzip cpio bc xz-utils patch openssl
+            libssl-dev libelf-dev zip unzip cpio bc xz-utils patch openssl \
+            clang-18 lld-18 llvm-18
+          clang-18 --version | head -1
+          ld.lld-18 --version | head -1
 
-      - name: Download kernel source and LLVM
+      - name: Download kernel and vendor sources
         run: |
           set -e
           mkdir -p workspace
           cd workspace
+
           aria2c -s16 -x16 -k1M -q \
             "https://github.com/${SOURCE_REPO}/archive/${{ inputs.source_commit }}.tar.gz" \
-            -o source.tar.gz
+            -o source.tar.gz &
+          A1=$!
           aria2c -s16 -x16 -k1M -q \
-            "https://github.com/llvm/llvm-project/releases/download/llvmorg-20.1.8/LLVM-20.1.8-Linux-X64.tar.xz" \
-            -o llvm.tar.xz
+            "https://github.com/${VENDOR_REPO}/archive/${{ inputs.vendor_commit }}.tar.gz" \
+            -o vendor.tar.gz &
+          A2=$!
+          wait $A1 $A2
 
           tar -xf source.tar.gz
           SRC_DIR=$(find . -maxdepth 1 -type d -name 'realme_neo7-AndroidB-kernel-source-*' | head -1)
-          [ -n "$SRC_DIR" ] || { echo "::error::source directory not found"; exit 1; }
+          [ -n "$SRC_DIR" ] || { echo "::error::kernel source directory not found"; exit 1; }
           mv "$SRC_DIR" common
 
-          mkdir clang20
-          tar -xf llvm.tar.xz
-          LLVM_DIR=$(find . -maxdepth 1 -type d -name 'LLVM-*' | head -1)
-          [ -n "$LLVM_DIR" ] || { echo "::error::LLVM directory not found"; exit 1; }
-          mv "$LLVM_DIR"/* clang20/
-          rm -f source.tar.gz llvm.tar.xz
+          tar -xf vendor.tar.gz
+          VSRC_DIR=$(find . -maxdepth 1 -type d -name 'realme_neo7-AndroidB-vendor-source-*' | head -1)
+          [ -n "$VSRC_DIR" ] || { echo "::error::vendor source directory not found"; exit 1; }
+          [ -d "$VSRC_DIR/vendor/oplus/kernel" ] \
+            || { echo "::error::vendor/oplus/kernel missing in vendor source"; exit 1; }
+          cp -a "$VSRC_DIR/vendor" common/vendor
 
-          echo "source: $(grep -m1 '^SUBLEVEL' common/Makefile)"
-          echo "clang:  $(./clang20/bin/clang --version | head -1)"
+          rm -f source.tar.gz vendor.tar.gz
+          rm -rf "$VSRC_DIR"
+
+          echo "kernel: $(grep -m1 '^SUBLEVEL' common/Makefile)"
+          echo "vendor/oplus/kernel subdirs: $(ls common/vendor/oplus/kernel | wc -l)"
 
       - name: Configure ccache
         run: |
@@ -122,6 +137,12 @@ jobs:
           grep -q 'ghost-task-sentinel' kernel/pid.c \
             || { echo "::error::oplus_bsp_midas patch did not apply"; exit 1; }
 
+          # The kernel tree references the OEM code through symlinks into
+          # vendor/; the vendor source repo supplies that tree.
+          echo "--- dangling symlinks after vendor overlay ---"
+          find . -xtype l | head -40
+          echo "dangling count: $(find . -xtype l | wc -l)"
+
       - name: Write defconfig
         run: |
           set -e
@@ -150,9 +171,8 @@ jobs:
           set -e
           set -o pipefail
           cd workspace/common
-          export PATH="$(pwd)/../clang20/bin:$PATH"
-          make -j"$(nproc)" LLVM=1 ARCH=arm64 O=out \
-            CC="ccache clang" LD=ld.lld HOSTLD=ld.lld \
+          make -j"$(nproc)" LLVM=-18 ARCH=arm64 O=out \
+            CC="ccache clang-18" \
             KCFLAGS+=-Wno-error rmx5062_defconfig 2>&1 | tee ../config.log
 
           echo "--- effective options ---"
@@ -167,7 +187,6 @@ jobs:
           set -e
           set -o pipefail
           cd workspace/common
-          export PATH="$(pwd)/../clang20/bin:$PATH"
           export CCACHE_DIR="${{ env.CCACHE_DIR }}"
           export CCACHE_COMPILERCHECK=none
           export CCACHE_BASEDIR="$(pwd)"
@@ -183,8 +202,8 @@ jobs:
           HB=$!
           trap 'kill $HB 2>/dev/null || true' EXIT
 
-          make -j"$(nproc)" LLVM=1 ARCH=arm64 O=out \
-            CC="ccache clang" LD=ld.lld HOSTLD=ld.lld \
+          make -j"$(nproc)" LLVM=-18 ARCH=arm64 O=out \
+            CC="ccache clang-18" \
             KCFLAGS+=-Wno-error Image 2>&1 | tee ../build.log
 
       - name: Verify
