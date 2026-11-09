@@ -122,16 +122,25 @@ jobs:
       - name: Prepare tree
         run: |
           set -e
+
+          # The kernel tree is a release tarball (no VCS metadata of its own),
+          # but it lives inside the checked-out build repo. scripts/setlocalversion
+          # walks up to $GITHUB_WORKSPACE/.git, sees local modifications and
+          # appends "+" to the release, which would break the vermagic. Drop the
+          # build repo's git metadata; nothing later depends on it.
+          rm -rf "$GITHUB_WORKSPACE/.git"
+          [ ! -e "$GITHUB_WORKSPACE/.git" ] || { echo "::error::could not remove build repo .git"; exit 1; }
+
           cd workspace/common
 
-          # Clang 20 is stricter than the compiler this 6.1 tree was written for.
+          # Clang 18 is stricter than the compiler this 6.1 tree was written for.
           sed -i 's/^override CFLAGS += -Werror -Wall$/override CFLAGS += -Wall/' tools/lib/bpf/Makefile
           grep -q '^override CFLAGS += -Wall$' tools/lib/bpf/Makefile \
             && echo "[fix] tools/lib/bpf: removed -Werror"
 
-          # Build happens from a release tarball (no .git), so setlocalversion
-          # cannot append -dirty. Kernel release is fully determined by
-          # CONFIG_LOCALVERSION and is checked in the Verify step.
+          # No .git anywhere above the tree now, so setlocalversion returns
+          # nothing and the release is exactly 6.1.134 + CONFIG_LOCALVERSION.
+          echo "setlocalversion: '$(scripts/setlocalversion .)'"
 
           # Apply the two mandatory Droidspaces patches.
           patch -p1 --batch -r - < ../../patches/01-fix_sysvipc_kabi_6_1_134.patch
@@ -221,6 +230,17 @@ jobs:
           [ "$UTS" = "6.1.134-${SUFFIX}" ] \
             || { echo "::error::UTS_RELEASE mismatch: expected 6.1.134-${SUFFIX}, got $UTS"; exit 1; }
 
+          # Also check the release baked into the Image itself: the banner and
+          # the vermagic string must not carry a "+" suffix.
+          IMG=out/arch/arm64/boot/Image
+          if grep -aq "6.1.134-${SUFFIX}+" "$IMG"; then
+            echo "::error::Image contains a '+' suffixed release string"
+            exit 1
+          fi
+          grep -aq "6.1.134-${SUFFIX}" "$IMG" \
+            || { echo "::error::release string not found in Image"; exit 1; }
+          echo "image release string: ok"
+
           CFG=out/include/config/auto.conf
           [ -f "$CFG" ] || CFG=out/.config
           for c in SYSVIPC POSIX_MQUEUE PID_NS IPC_NS USER_NS DEVTMPFS MACVLAN; do
@@ -239,6 +259,22 @@ jobs:
             || { echo "::error::CONFIG_ANDROID_KABI_RESERVE must be enabled"; exit 1; }
           echo "verification passed"
 
+      - name: Dump kernel symbol CRCs
+        if: always() && !cancelled()
+        run: |
+          cd workspace/common
+          SYS=out/vmlinux.symvers
+          if [ -s "$SYS" ]; then
+            echo "vmlinux.symvers lines: $(wc -l < "$SYS")"
+            head -3 "$SYS"
+            # Compact "0xCRC symbol" list for the ABI checker.
+            awk -F'\t' '$1 ~ /^0x[0-9a-fA-F]+$/ { print $1, $2 }' "$SYS" \
+              | sort -u > ../vmlinux-crcs.txt
+            echo "crcs.txt lines: $(wc -l < ../vmlinux-crcs.txt)"
+          else
+            echo "::warning::out/vmlinux.symvers not found"
+          fi
+
       - name: Upload raw Image
         if: always() && !cancelled()
         uses: actions/upload-artifact@v4
@@ -253,10 +289,13 @@ jobs:
         with:
           name: kernel-meta-6.1.134
           path: |
-            workspace/common/out/Module.symvers
+            workspace/common/out/vmlinux.symvers
+            workspace/common/out/System.map
             workspace/common/out/.config
             workspace/common/out/include/generated/utsrelease.h
             workspace/common/out/include/config/auto.conf
+            workspace/vmlinux-crcs.txt
+          include-hidden-files: true
           if-no-files-found: warn
 
       - name: Save ccache
