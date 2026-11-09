@@ -307,7 +307,7 @@ jobs:
               [ -f "out/$o" ] || { echo "::error::missing out/$o"; exit 1; }
             done
           fi
-          for c in CFS_BANDWIDTH CGROUP_PIDS MODULE_SIG_FORCE; do
+          for c in CFS_BANDWIDTH CGROUP_PIDS MODULE_SIG_FORCE MODVERSIONS; do
             grep -q "^CONFIG_${c}=y$" "$CFG" \
               && { echo "::error::CONFIG_${c} must not be enabled"; exit 1; }
           done
